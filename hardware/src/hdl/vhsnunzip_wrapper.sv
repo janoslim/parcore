@@ -240,6 +240,10 @@ module VHSNUnzipWrapperInternal #(
                         : 0;
             end
             out.keep <= tmp_keep;
+        end else begin
+            // A short first page never writes the unused upper keep slices.
+            out.keep <= '0;
+            out.last <= 1'b0;
         end
     end
 
