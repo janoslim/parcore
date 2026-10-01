@@ -50,6 +50,7 @@ data32_t                 remaining_chunk_num_values, n_remaining_chunk_num_value
 page_type_t parsed_page_type,    n_parsed_page_type;
 data32_t    remaining_comp_size, n_remaining_comp_size;
 data32_t    parsed_num_values,   n_parsed_num_values;
+data32_t    parsed_uncompressed_size, n_parsed_uncompressed_size;
 
 logic page_conf_valid, n_page_conf_valid;
 
@@ -101,6 +102,7 @@ always_ff @(posedge clk) begin
         parsed_page_type    <= PAGE_TYPE_HYBRID;
         remaining_comp_size <= 'X;
         parsed_num_values   <= 'X;
+        parsed_uncompressed_size <= 'X;
         page_conf_valid     <= 1'b0;
 
         payload.data  <= 'X;
@@ -120,6 +122,7 @@ always_ff @(posedge clk) begin
         parsed_page_type    <= n_parsed_page_type;
         remaining_comp_size <= n_remaining_comp_size;
         parsed_num_values   <= n_parsed_num_values;
+        parsed_uncompressed_size <= n_parsed_uncompressed_size;
         page_conf_valid     <= n_page_conf_valid;
 
         payload.data  <= n_payload_data;
@@ -150,6 +153,7 @@ always_comb begin
     n_parsed_page_type    = parsed_page_type;
     n_remaining_comp_size = remaining_comp_size;
     n_parsed_num_values   = parsed_num_values;
+    n_parsed_uncompressed_size = parsed_uncompressed_size;
 
     // Hold valid until accepted, then deassert
     n_page_conf_valid = page_conf_valid && !page_conf.ready;
@@ -199,8 +203,9 @@ always_comb begin
             end
         end
         SKIP_UNCOMP: begin
-            // Discard uncompressed size
             if (skip_bytes == 0 && remaining_bytes != 3) begin
+                // String consumers need the page byte boundary after decompression.
+                n_parsed_uncompressed_size = cur_value;
                 n_skip_bytes = cur_length;
                 n_state      = PARSE_COMP;
             end
@@ -408,6 +413,7 @@ NDataSkidBuffer #(data8_t, NUM_BYTES) inst_skid_out (
 // ---- page_conf output ---------------------------------------------------------------------------
 assign page_conf.data.page_type  = parsed_page_type;
 assign page_conf.data.num_values = parsed_num_values;
+assign page_conf.data.uncompressed_size = parsed_uncompressed_size;
 assign page_conf.data.last       = remaining_chunk_num_values == 0;
 assign page_conf.valid           = page_conf_valid;
 

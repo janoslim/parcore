@@ -28,11 +28,12 @@ module ColumnChunkDecoder #(
 localparam NUM_IDS = 16;
 
 // ------ Multiplexing declarations ---------------
-localparam int NUM_IN = 3;
+localparam int NUM_IN = 4;
 typedef enum logic [$bits(page_type_t) - 1:0] {
     IN_HYBRID = PAGE_TYPE_HYBRID,
     IN_DICT = PAGE_TYPE_DICT,
-    IN_PLAIN = PAGE_TYPE_PLAIN
+    IN_PLAIN = PAGE_TYPE_PLAIN,
+    IN_STRING = 3
 } in_selector_t;
 `ASSERT_ELAB(NUM_IN <= 2**$bits(in_selector_t))
 
@@ -48,6 +49,11 @@ typed_ndata_i #(DATABEAT_SIZE) outs[NUM_OUT](clk, reset_synced);
 
 ready_valid_i #(in_selector_t)  in_select(clk, reset_synced);
 ready_valid_i #(out_selector_t) out_select(clk, reset_synced);
+
+// Keep the chunk route until its final output handshake, including stalls.
+ready_valid_i #(logic) chunk_out_select(clk, reset_synced);
+typed_ndata_i #(DATABEAT_SIZE) chunk_outs[2](clk, reset_synced);
+ready_valid_i #(page_conf_t) string_page_conf(clk, reset_synced);
 
 // ------ PageHeaderParser wiring -----------------
 ready_valid_i #(column_chunk_conf_t) chunk_confs[2](clk, reset_synced);
@@ -97,6 +103,15 @@ DataDemultiplexer #(NUM_IN) inst_multiplexer (
 
     .in(decompressor_out),
     .out(ins)
+);
+
+StringPageFramer #(DATABEAT_SIZE) inst_string_page_framer (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .conf(string_page_conf),
+    .in(ins[IN_STRING]),
+    .out(chunk_outs[1])
 );
 
 // ------ Hybrid decoder + dictionary wiring ------
@@ -225,6 +240,15 @@ TypedNormalizeUntil #(
     .size(num_values),
 
     .in(inner_out),
+    .out(chunk_outs[0])
+);
+
+TypedNDataMultiplexer #(DATABEAT_SIZE, 2) inst_chunk_output_multiplexer (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .select(chunk_out_select),
+    .in(chunk_outs),
     .out(out)
 );
 
@@ -258,6 +282,8 @@ always_ff @(posedge clk) begin
         plain_type.valid  <= 1'b0;
         in_select.valid   <= 1'b0;
         out_select.valid  <= 1'b0;
+        chunk_out_select.valid <= 1'b0;
+        string_page_conf.valid <= 1'b0;
 
         typ       <= BYTE_T;
         last_page <= 'X;
@@ -269,7 +295,10 @@ always_ff @(posedge clk) begin
                     decompressor_conf.data <= chunk_confs[0].data.compression;
 
                     num_values.data  <= chunk_confs[0].data.num_values;
-                    num_values.valid <= 1'b1;
+                    num_values.valid <= chunk_confs[0].data.typ != BYTE_T;
+
+                    chunk_out_select.data <= chunk_confs[0].data.typ == BYTE_T;
+                    chunk_out_select.valid <= 1'b1;
 
                     typ       <= chunk_confs[0].data.typ;
                     dict_seen <= 1'b0;
@@ -290,6 +319,11 @@ always_ff @(posedge clk) begin
                     // 1. Route input from the decompressor
                     // 2. Configure the module that will transform/consume the input
                     // 3. Configure the output multiplexing any
+                    if (typ == BYTE_T) begin
+                        in_select.data <= IN_STRING;
+                        string_page_conf.data <= page_conf.data;
+                        string_page_conf.valid <= 1'b1;
+                    end else begin
                     case (page_conf.data.page_type)
                         PAGE_TYPE_HYBRID: begin
                             in_select.data <= IN_HYBRID;
@@ -332,6 +366,7 @@ always_ff @(posedge clk) begin
                             end
                         end
                     endcase
+                    end
                 end
             end
             ST_PROCESS_PAGE: begin
@@ -363,6 +398,10 @@ always_ff @(posedge clk) begin
                     hybrid_num_values.valid <= 1'b0;
                 end
 
+                if (string_page_conf.ready) begin
+                    string_page_conf.valid <= 1'b0;
+                end
+
                 // If all configurations/selectors are invalid, it means they
                 // have been successfully consumed by the multiplexers/decoders
                 // (or not been set in the first place) and thus we can move
@@ -371,7 +410,7 @@ always_ff @(posedge clk) begin
                 //   a new column chunk configuration next.
                 // - CONFIGURED if this was not the last page and this column
                 //   chunk has more pages to be fully decoded.
-                if (!decompressor_conf.valid && !hybrid_conf.valid && !dict_type.valid && !plain_type.valid && !in_select.valid && !out_select.valid) begin
+                if (!decompressor_conf.valid && !hybrid_conf.valid && !dict_type.valid && !plain_type.valid && !in_select.valid && !out_select.valid && !string_page_conf.valid) begin
                     if (last_page) begin
                         state <= ST_IDLE;
                     end else begin
@@ -386,10 +425,14 @@ always_ff @(posedge clk) begin
                 num_values.valid <= 1'b0;
             end
         end
+
+        if (chunk_out_select.ready) begin
+            chunk_out_select.valid <= 1'b0;
+        end
     end
 end
 
-assign chunk_confs[0].ready = state == ST_IDLE;
+assign chunk_confs[0].ready = state == ST_IDLE && !chunk_out_select.valid;
 assign page_conf.ready      = state == ST_CONFIGURED;
 
 // ------ Stream profiling ------------------------

@@ -88,6 +88,7 @@ typedef struct packed {
 typedef struct packed {
     page_type_t page_type;
     data32_t    num_values;
+    data32_t    uncompressed_size;
     logic       last;
 } page_conf_t;
 
