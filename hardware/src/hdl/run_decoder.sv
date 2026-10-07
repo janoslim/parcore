@@ -77,6 +77,32 @@ logic[$clog2(NUM_ELEMENTS) + $bits(bit_width_t) - 1 - $clog2(8):0] packed_databe
 logic[$clog2(8) + $bits(bit_width_t) - 1 - $clog2(8):0] eight_packed_databeat_bytes;
 offset_t varint_offset;
 
+// ------- Registered lookahead (RunDecoderTiming, decoder-timing-fix findings.md section 11) -----
+// Post-route, the worst RunDecoder paths decided a handshake from a keep lookup at a computed index
+// (keep[offset + packed_databeat_bytes - 1], keep[offset + i]) and then, in the same cycle, read the
+// next varint at an index that itself depended on the varint just decoded: 10-14 logic levels
+// (diag-decoder-d0hse-timing-03/endpoints-post_route_phys_opt.tsv, ooc proxy decoder-hse_r1-01).
+// Each register below holds a value the original computed combinationally. It is written at every
+// point where that value's inputs change, so the ports behave as before cycle for cycle; only the
+// position of the logic relative to the flops changes.
+//
+// bvb_r == keep[offset] && keep[offset + packed_databeat_bytes - 1]       (read in ST_DECODE_BPE)
+// rvb_r == AND over i < DATA_SIZE of (i >= rle_width || keep[offset + i]) (read in ST_DECODE_RLE)
+// Both are read only in the decode states, and every entry into a decode state goes through
+// goto_decode(), which writes them.
+logic bvb_r, rvb_r;
+// vbase_r    == varint_offset + 1 + rle_width     (mod 128)
+// vbase_m[k] == varint_offset + 1 + k * bit_width (mod 128), k = 0..3
+// A run that starts right after the varint at varint_offset is followed by the next varint at
+// varint_offset + length + payload, with payload rle_width (RLE) or k * bit_width (a bit-packed run of
+// k <= 3 groups, the only one goto_decode_bpe() reads ahead for). As flops, these bases let the
+// next-varint window be read from registers while the decoded length selects inside it afterwards.
+// They follow varint_offset every cycle except the one cycle after goto_decode_bpe() enters a run with
+// two or more 16-value inputs left, when no window read can happen.
+offset_t vbase_r;
+offset_t vbase_m[4];
+offset_t bw_x3; // 3 * bit_width mod 128, captured with the configuration
+
 // ------- Output declaration -----
 typedef enum logic {
   OUTPUT_RLE,
@@ -169,10 +195,6 @@ assign varint_no_encoding = varint_out.data.value >> 1;
 bpe_count_t varint_no_encoding_bytes;
 assign varint_no_encoding_bytes = varint_no_encoding  << 3;
 
-// This value always points at the first byte after the varint
-offset_t offset_after_varint;
-assign offset_after_varint = varint_offset + varint_out.data.length;
-
 // ------- RLE decoding
 tagged_i #(data_t, $bits(rle_count_t)) rle_in(clk, reset_synced);
 ndata_i #(data_t, NUM_ELEMENTS) rle_out(clk, reset_synced);
@@ -189,8 +211,6 @@ ExpandRLE #(
 );
 
 assign rle_in.tag = rle_count;
-logic[DATA_SIZE - 1:0] rle_in_valid_bits;
-logic[DATA_SIZE - 1:0] rle_needs_to_buffer_bits;
 generate
 for (genvar i = 0; i < DATA_SIZE; i++) begin
     // We need to copy bit-by-bit here as for value sizes that are not
@@ -200,13 +220,13 @@ for (genvar i = 0; i < DATA_SIZE; i++) begin
     for (genvar b = 0; b < 8 && i * 8 + b < $bits(data_t); b++) begin
         assign rle_in.data[i * 8 + b] = (i < rle_width) ? data[offset+i][b] : '0;
     end
-    assign rle_in_valid_bits[i] = (i >= rle_width) || keep[offset+i];
-    assign rle_needs_to_buffer_bits[i] = (i < rle_width && ~keep[offset+i]);
 end
 endgenerate
-assign rle_in.valid = can_decode_next &&state == ST_DECODE_RLE && &rle_in_valid_bits;
+// rvb_r is the registered &rle_in_valid_bits of the original (see its declaration).
+assign rle_in.valid = can_decode_next &&state == ST_DECODE_RLE && rvb_r;
 logic rle_needs_more_input;
-assign rle_needs_more_input = |rle_needs_to_buffer_bits && ~last_received;
+// The original |rle_needs_to_buffer_bits is exactly ~&rle_in_valid_bits.
+assign rle_needs_more_input = ~rvb_r && ~last_received;
 
 // ------- BPE decoding
 bpe_config_t bpe_in_tag;
@@ -234,11 +254,10 @@ assign bpe_in.data = bpe_data[offset * 8 +: $bits(data_t) * NUM_ELEMENTS];
 assign bpe_in.last = bpe_count <= NUM_ELEMENTS;
 assign bpe_in.tag = bpe_in_tag;
 // OPTIMIZATION: here we're only checking for the first and last bit of the
-// desired keep region, to avoid a wide & over several bits.
-logic bpe_valid_bytes, bpe_valid_bytes_lo, bpe_valid_bytes_hi;
-assign bpe_valid_bytes_lo = keep[offset];
-assign bpe_valid_bytes_hi = keep[offset + packed_databeat_bytes - 1];
-assign bpe_valid_bytes = bpe_valid_bytes_lo && bpe_valid_bytes_hi;
+// desired keep region, to avoid a wide & over several bits. bvb_r holds that
+// pair for the current offset (see its declaration).
+logic bpe_valid_bytes;
+assign bpe_valid_bytes = bvb_r;
 
 assign bpe_in.valid = can_decode_next && state == ST_DECODE_BPE && (bpe_valid_bytes || last_received) && bpe_count > 0;
 
@@ -246,6 +265,216 @@ assign bpe_in.valid = can_decode_next && state == ST_DECODE_BPE && (bpe_valid_by
 // only if we haven't already consumed the last databeat.
 logic bpe_needs_more_input;
 assign bpe_needs_more_input = ~bpe_valid_bytes && ~last_received;
+
+// ------- Lookahead candidates for bvb_r / rvb_r -----
+// keep reads past the double buffer return 0: that is what the original reads one cycle later from the
+// half update_offset() has just zeroed (keep_zext). Indices use 8-bit arithmetic, exact for bit widths
+// up to 63 (offset <= 127, packed_databeat_bytes <= 126; the RunDecoder's ids are 19 bits). Where the
+// original index ran past the buffer itself, or below 0, it read X, which the interfaces' not-undefined
+// assertions exclude from passing runs. data_twice/keep_twice repeat the buffer so a `+:` window wraps
+// mod 128 inside the mux select, with no adder in front of it.
+data8_t[NUM_BYTES * 4 - 1:0] data_twice;
+logic[NUM_BYTES * 4 - 1:0] keep_twice, keep_zext;
+assign data_twice = {data, data};
+assign keep_twice = {keep, keep};
+assign keep_zext = {{(NUM_BYTES * 2){1'b0}}, keep};
+
+// (a) store_input(): the half named by store_in_second_half takes in.keep and offset stays. A store
+// never coincides with an offset update: the decode states and ST_HEADER2 accept input only in cycles
+// in which they cannot advance.
+logic[NUM_BYTES * 2 - 1:0] store_keep;
+assign store_keep = store_in_second_half ? {in_keep, keep[NUM_BYTES - 1:0]}
+                                         : {keep[NUM_BYTES * 2 - 1:NUM_BYTES], in_keep};
+logic[NUM_BYTES * 4 - 1:0] store_keep_zext;
+assign store_keep_zext = {{(NUM_BYTES * 2){1'b0}}, store_keep};
+logic[7:0] store_end; // offset + packed_databeat_bytes - 1
+assign store_end = 8'(offset) + 8'(packed_databeat_bytes) - 8'd1;
+logic[DATA_SIZE - 1:0] store_keep_at;
+assign store_keep_at = store_keep_zext[offset +: DATA_SIZE];
+logic bvb_store, rvb_store;
+logic[DATA_SIZE - 1:0] rvb_store_bits;
+assign bvb_store = store_keep[offset] && store_keep_zext[store_end];
+generate
+for (genvar i = 0; i < DATA_SIZE; i++) begin : gen_store_lookahead
+    assign rvb_store_bits[i] = (i >= rle_width) || store_keep_at[i];
+end
+endgenerate
+assign rvb_store = &rvb_store_bits;
+
+// (b) advance_bpe(): update_offset(offset + packed_databeat_bytes). The next cycle's
+// keep[trim(n)] and keep[trim(n) + packed_databeat_bytes - 1], after the optional shift, are this
+// buffer's bytes n and n + packed_databeat_bytes - 1 with zeros past it.
+offset_t advance_offset;
+assign advance_offset = offset + packed_databeat_bytes;
+logic[7:0] advance_end; // advance_offset + packed_databeat_bytes - 1
+assign advance_end = 8'(advance_offset) + 8'(packed_databeat_bytes) - 8'd1;
+logic bvb_advance;
+assign bvb_advance = keep[advance_offset] && keep_zext[advance_end];
+
+// (c) goto_decode(): update_offset(varint_offset + varint length), one candidate per length 1..4;
+// the decoded length selects afterwards (oav_l[L] is offset_after_varint for length L). The keep bits
+// are read as windows at registered bases (no adder in front of the mux): offset_after_varint wraps
+// mod 128 (keep_twice), the run bytes after it read zero past the buffer (keep_zext).
+logic[6:0] goto_keep_wrap, goto_keep_zero;
+assign goto_keep_wrap = keep_twice[varint_offset +: 7];
+assign goto_keep_zero = keep_zext[varint_offset +: 7];
+// keep at offset_after_varint + packed_databeat_bytes - 1 = goto_end + length - 1, and the same mod 128
+// when offset_after_varint itself wrapped (exact for bit widths up to 63; the RunDecoder's ids are 19 bits).
+logic[7:0] goto_end;
+assign goto_end = 8'(varint_offset) + 8'(packed_databeat_bytes);
+logic[3:0] goto_keep_end, goto_keep_end_wrap;
+assign goto_keep_end = keep_zext[goto_end +: 4];
+assign goto_keep_end_wrap = keep_zext[goto_end[$bits(offset_t) - 1:0] +: 4];
+logic[4:1] bvb_goto_l, rvb_goto_l;
+offset_t oav_l[4:1];
+generate
+for (genvar L = 1; L <= 4; L++) begin : gen_goto_lookahead
+    logic wrap;
+    logic[DATA_SIZE - 1:0] rb;
+    assign oav_l[L] = varint_offset + offset_t'(L);
+    assign wrap = 32'(varint_offset) + L >= NUM_BYTES * 2;
+    for (genvar i = 0; i < DATA_SIZE; i++) begin : gen_rle_bits
+        assign rb[i] = (i >= rle_width) || (wrap ? goto_keep_wrap[L + i] : goto_keep_zero[L + i]);
+    end
+    assign rvb_goto_l[L] = &rb;
+    assign bvb_goto_l[L] = goto_keep_wrap[L] && (wrap ? goto_keep_end_wrap[L - 1] : goto_keep_end[L - 1]);
+end
+endgenerate
+
+// ------- Next-varint windows -----
+// Every write of varint_in reads 4 bytes, plus the keep bits of the validity test, at one of a few
+// indices. The original computed the index in place and called update_varint_data() /
+// next_varint_valid() with it; here each window is read in parallel from flops and the state machine
+// only selects. Windows are `+:` part-selects of the buffer written twice in a row (data_twice,
+// keep_twice above), so an index wraps mod 128 inside the mux select with no adder in front of it.
+// Where the original read past the double buffer it read X; the two agree wherever it is defined.
+
+// ST_IDLE / ST_HEADER: in.data zero-extended to the double buffer, at the configured offset (ST_IDLE)
+// or at varint_offset (ST_HEADER, which holds that same configured offset).
+offset_t win_in_base;
+assign win_in_base = state == ST_IDLE ? conf_data.offset : varint_offset;
+data8_t[NUM_BYTES * 4 - 1:0] in_data_zext;
+logic[NUM_BYTES * 4 - 1:0] in_keep_zext;
+assign in_data_zext = {{(NUM_BYTES * 3){8'h00}}, in_data};
+assign in_keep_zext = {{(NUM_BYTES * 3){1'b0}}, in_keep};
+data8_t[3:0] win_in;
+logic[3:0] win_in_keep;
+logic win_in_valid;
+assign win_in = in_data_zext[win_in_base +: 4];
+assign win_in_keep = in_keep_zext[win_in_base +: 4];
+assign win_in_valid = win_in_keep[0] && (in.last || &win_in_keep[3:1]);
+
+// ST_HEADER2 reads next_data at varint_offset; advance_bpe() with one 16-value input left and
+// finish_bpe() without a decoded varint read the buffer at varint_offset or varint_offset + 64.
+data8_t[NUM_BYTES * 2 - 1:0] in_data_twice;
+logic[NUM_BYTES * 2 - 1:0] in_keep_twice;
+assign in_data_twice = {in_data, in_data};
+assign in_keep_twice = {in_keep, in_keep};
+data8_t[3:0] win_at0, win_at1, win_next, win_in_at;
+logic[3:0] win_at0_keep, win_at1_keep, win_next_keep, win_in_at_keep;
+logic win_at0_valid, win_at1_valid, win_next_valid;
+assign win_at0 = data_twice[varint_offset +: 4];
+assign win_at0_keep = keep_twice[varint_offset +: 4];
+assign win_at1 = data_twice[(varint_offset ^ offset_t'(NUM_BYTES)) +: 4]; // varint_offset + 64 mod 128
+assign win_at1_keep = keep_twice[(varint_offset ^ offset_t'(NUM_BYTES)) +: 4];
+assign win_in_at = in_data_twice[varint_offset[$clog2(NUM_BYTES) - 1:0] +: 4];
+assign win_in_at_keep = in_keep_twice[varint_offset[$clog2(NUM_BYTES) - 1:0] +: 4];
+generate
+for (genvar j = 0; j < 4; j++) begin : gen_win_next
+    // next_data takes in.data in the half store_in_second_half names; byte varint_offset + j lies in
+    // the upper half when bit 6 of that sum is set.
+    offset_t x;
+    assign x = varint_offset + offset_t'(j);
+    assign win_next[j] = x[$clog2(NUM_BYTES)] == store_in_second_half ? win_in_at[j] : win_at0[j];
+    assign win_next_keep[j] = x[$clog2(NUM_BYTES)] == store_in_second_half ? win_in_at_keep[j] : win_at0_keep[j];
+end
+endgenerate
+assign win_at0_valid = win_at0_keep[0] && (last_received || &win_at0_keep[3:1]);
+assign win_at1_valid = win_at1_keep[0] && (last_received || &win_at1_keep[3:1]);
+assign win_next_valid = win_next_keep[0] && (next_last_received || &win_next_keep[3:1]);
+
+// goto_decode(): the next varint starts at varint_offset + length + payload, i.e. at
+// goto_base + length - 1 with goto_base one of the registered vbase_*. The 7-byte window at goto_base
+// covers all four lengths; the length then picks 4 bytes out of it.
+logic goto_bpe;
+logic[1:0] goto_groups;
+assign goto_bpe = varint_out.data.value[0];    // == varint_encoding
+assign goto_groups = varint_out.data.value[2:1]; // 8-value groups when the run has <= 3 of them
+offset_t goto_base;
+assign goto_base = goto_bpe ? vbase_m[goto_groups] : vbase_r;
+data8_t[6:0] goto_window;
+logic[6:0] goto_window_keep;
+assign goto_window = data_twice[goto_base +: 7];
+assign goto_window_keep = keep_twice[goto_base +: 7];
+
+// New bases once goto_decode() moves varint_offset to the next varint. The new varint_offset is the
+// next varint's index (goto_base + length - 1) with bit 6 cleared by trim_offset() for a bit-packed
+// run, or offset_after_varint's bit 6 removed for an RLE run (trim_offset(oav) + rle_width); adding the
+// base constants commutes with that bit flip mod 128.
+offset_t goto_sum_r, goto_sum_m[4];
+assign goto_sum_r = goto_base + offset_t'(rle_width);
+assign goto_sum_m[0] = goto_base;
+assign goto_sum_m[1] = goto_base + offset_t'(bit_width);
+assign goto_sum_m[2] = goto_base + offset_t'(2 * bit_width);
+assign goto_sum_m[3] = goto_base + bw_x3;
+
+data8_t[3:0] win_goto;
+logic win_goto_valid;
+logic bvb_goto, rvb_goto;
+offset_t goto_oav;
+always_comb begin
+    case (varint_out.data.length)
+        VARINT_LENGTH_BITS'(1): begin
+            win_goto = goto_window[3:0];
+            win_goto_valid = goto_window_keep[0] && (last_received || &goto_window_keep[3:1]);
+            bvb_goto = bvb_goto_l[1];
+            rvb_goto = rvb_goto_l[1];
+            goto_oav = oav_l[1];
+        end
+        VARINT_LENGTH_BITS'(2): begin
+            win_goto = goto_window[4:1];
+            win_goto_valid = goto_window_keep[1] && (last_received || &goto_window_keep[4:2]);
+            bvb_goto = bvb_goto_l[2];
+            rvb_goto = rvb_goto_l[2];
+            goto_oav = oav_l[2];
+        end
+        VARINT_LENGTH_BITS'(3): begin
+            win_goto = goto_window[5:2];
+            win_goto_valid = goto_window_keep[2] && (last_received || &goto_window_keep[5:3]);
+            bvb_goto = bvb_goto_l[3];
+            rvb_goto = rvb_goto_l[3];
+            goto_oav = oav_l[3];
+        end
+        // A decoded varint (the only kind goto_decode() consumes) has length 1..4.
+        default: begin
+            win_goto = goto_window[6:3];
+            win_goto_valid = goto_window_keep[3] && (last_received || &goto_window_keep[6:4]);
+            bvb_goto = bvb_goto_l[4];
+            rvb_goto = rvb_goto_l[4];
+            goto_oav = oav_l[4];
+        end
+    endcase
+end
+
+offset_t goto_index, goto_flip;
+assign goto_index = goto_base + offset_t'(varint_out.data.length) - 7'd1;
+assign goto_flip = {goto_bpe ? goto_index[$bits(offset_t) - 1] : goto_oav[$bits(offset_t) - 1],
+                    {($bits(offset_t) - 1){1'b0}}};
+offset_t goto_new_r, goto_new_m[4];
+assign goto_new_r = (goto_sum_r + offset_t'(varint_out.data.length)) ^ goto_flip;
+generate
+for (genvar k = 0; k < 4; k++) begin : gen_goto_new
+    assign goto_new_m[k] = (goto_sum_m[k] + offset_t'(varint_out.data.length)) ^ goto_flip;
+end
+endgenerate
+
+// The bases implied by the current varint_offset; the default next value of vbase_*.
+offset_t refresh_r, refresh_m[4];
+assign refresh_r = varint_offset + offset_t'(rle_width) + 7'd1;
+assign refresh_m[0] = varint_offset + 7'd1;
+assign refresh_m[1] = varint_offset + offset_t'(bit_width) + 7'd1;
+assign refresh_m[2] = varint_offset + offset_t'(2 * bit_width) + 7'd1;
+assign refresh_m[3] = varint_offset + bw_x3 + 7'd1;
 
 
 // ------- Combinatorial input ---
@@ -277,6 +506,10 @@ task store_input();
     last_received <= next_last_received;
 
     store_in_second_half <= ~store_in_second_half;
+
+    // Lookahead at the unchanged offset over the keep just stored.
+    bvb_r <= bvb_store;
+    rvb_r <= rvb_store;
 endtask
 
 task update_offset(input offset_t next_offset);
@@ -300,6 +533,11 @@ task update_offset(input offset_t next_offset);
 
         if (varint_offset >= NUM_BYTES) begin
             varint_offset <= trim_offset(varint_offset);
+            // varint_offset - NUM_BYTES flips bit 6 of every mod-128 base derived from it.
+            vbase_r <= refresh_r ^ offset_t'(NUM_BYTES);
+            for (int k = 0; k < 4; k++) begin
+                vbase_m[k] <= refresh_m[k] ^ offset_t'(NUM_BYTES);
+            end
         end
     end
     offset <= trim_offset(next_offset);
@@ -325,6 +563,9 @@ task reset();
     rle_width <= 'x;
     rle_count <= 'x;
     bpe_count <= 'x;
+
+    bvb_r <= 1'b0;
+    rvb_r <= 1'b0;
 endtask
 
 task goto_decode(input data32_t remaining_values);
@@ -341,19 +582,23 @@ task goto_decode(input data32_t remaining_values);
     end
     `endif
 
-    update_offset(offset_after_varint);
+    // goto_oav == offset_after_varint: varint_offset + length chosen among precomputed sums.
+    update_offset(goto_oav);
+    // Lookahead at the run's first input.
+    bvb_r <= bvb_goto;
+    rvb_r <= rvb_goto;
     if (varint_encoding == ENCODING_BPE) begin
         state <= ST_DECODE_BPE;
 
         // Compute BPE properties
         bpe_count <= next_bpe_count;
 
-        goto_decode_bpe(next_bpe_padded_count, offset_after_varint);
+        goto_decode_bpe(next_bpe_padded_count, goto_oav);
     end else begin
         // Compute RLE properties
         rle_count <= varint_no_encoding;
 
-        goto_decode_rle(offset_after_varint);
+        goto_decode_rle(goto_oav);
     end
 endtask
 
@@ -395,9 +640,19 @@ task goto_decode_bpe(
         // and shifted the data, so we store the varint_offset trimmed
         // (outside of this loop) but compute the correct varint_in data to
         // match.
-        update_varint_data(data, next_varint_offset);
-        varint_in.valid <= next_varint_valid(keep, last_received, next_varint_offset);
+        // With at most one 16-value input, next_varint_offset is
+        // offset_after_varint + groups * bit_width = goto_base + length - 1,
+        // the start of win_goto.
+        varint_in.data <= win_goto;
+        varint_in.valid <= win_goto_valid;
+        vbase_r <= goto_new_r;
+        for (int k = 0; k < 4; k++) begin
+            vbase_m[k] <= goto_new_m[k];
+        end
     end else begin
+        // vbase_* take the default refresh from this cycle's varint_offset and
+        // are refreshed from the new one in the next cycle; this run has at
+        // least two inputs left, so no goto_decode() reads them in between.
         varint_in.valid <= 0;
     end
 
@@ -417,6 +672,7 @@ task advance_bpe();
     remaining_values <= remaining_values - NUM_ELEMENTS;
     bpe_remaining_inputs <= next_bpe_remaining_inputs;
     update_offset(next_offset);
+    bvb_r <= bvb_advance;
 
     `ifndef SYNTHESIS
     if (bpe_remaining_inputs == 0 || bpe_in.last) begin
@@ -444,9 +700,11 @@ task advance_bpe();
         // The varint offset shall never be > 64.
         increment_varint_offset = next_offset > varint_offset && next_next_offset >= NUM_BYTES;
         actual_varint_offset = increment_varint_offset ? varint_offset + NUM_BYTES : varint_offset;
-        next_varint_in_valid = next_varint_valid(keep, last_received, actual_varint_offset);
+        // The two candidate windows (at varint_offset and varint_offset + 64)
+        // are read in parallel; the comparison above only selects.
+        next_varint_in_valid = increment_varint_offset ? win_at1_valid : win_at0_valid;
 
-        update_varint_data(data, actual_varint_offset);
+        varint_in.data <= increment_varint_offset ? win_at1 : win_at0;
         varint_in.valid <= next_varint_in_valid;
 
         // We only want to store the offset if we haven't trimmed the input in
@@ -455,6 +713,10 @@ task advance_bpe();
         // already correct.
         if (~next_varint_in_valid && next_offset < NUM_BYTES) begin
             varint_offset <= actual_varint_offset;
+            vbase_r <= increment_varint_offset ? refresh_r ^ offset_t'(NUM_BYTES) : refresh_r;
+            for (int k = 0; k < 4; k++) begin
+                vbase_m[k] <= increment_varint_offset ? refresh_m[k] ^ offset_t'(NUM_BYTES) : refresh_m[k];
+            end
         end
     end
 endtask
@@ -464,7 +726,9 @@ task finish_bpe();
     next_remaining_values = remaining_values - bpe_count;
 
     remaining_values <= next_remaining_values;
-    if (next_remaining_values == 0) begin
+    // next_remaining_values == 0 exactly when the operands are equal (bpe_count zero-extends), which
+    // keeps the 32-bit subtract's carry chain off the decision.
+    if (remaining_values == data32_t'(bpe_count)) begin
         reset();
     end else if (varint_out.valid) begin
         // If the varint for the next databeat is already valid and parsed, we can
@@ -485,8 +749,8 @@ task finish_bpe();
         // NOTE: this update here is needed as this last BPE decoding might
         // have involved receiving more input, meaning that the varint may now
         // be valid.
-        update_varint_data(data, actual_varint_offset);
-        varint_in.valid <= next_varint_valid(keep, last_received, actual_varint_offset);
+        varint_in.data <= (varint_offset <= offset) ? win_at1 : win_at0;
+        varint_in.valid <= (varint_offset <= offset) ? win_at1_valid : win_at0_valid;
         update_offset(actual_varint_offset);
 
         // If ~varint_out.valid we need to fetch more input to
@@ -504,8 +768,13 @@ task goto_decode_rle(input offset_t offst);
     // the data will be shifted but only from the next cycle, so when indexing
     // data and keep to populate the varint decoder, we need to use the
     // current offset.
-    update_varint_data(data, offst + rle_width);
-    varint_in.valid <= next_varint_valid(keep, last_received, offst + rle_width);
+    // offst + rle_width == goto_base + length - 1, the start of win_goto.
+    varint_in.data <= win_goto;
+    varint_in.valid <= win_goto_valid;
+    vbase_r <= goto_new_r;
+    for (int k = 0; k < 4; k++) begin
+        vbase_m[k] <= goto_new_m[k];
+    end
 endtask
 
 task finish_rle();
@@ -513,7 +782,8 @@ task finish_rle();
     next_remaining_values = remaining_values - rle_count;
 
     remaining_values <= next_remaining_values;
-    if (next_remaining_values == 0) begin
+    // See finish_bpe(): equality instead of the subtract's zero test.
+    if (remaining_values == data32_t'(rle_count)) begin
         reset();
     end else if (varint_out.valid) begin
         // If the varint for the next databeat is already valid and parsed, we can
@@ -527,18 +797,17 @@ task finish_rle();
     end
 endtask
 
-task update_varint_data(input data8_t[NUM_BYTES * 2 - 1:0] new_data, offset_t new_offst);
-    varint_in.data <= new_data[new_offst +: 4];
-endtask
-
-function next_varint_valid(input logic[NUM_BYTES * 2 - 1:0] keep, logic last_received, offset_t offst);
-    next_varint_valid = keep[offst] && (last_received || (&keep[(offst + 1) +: 3]));
-endfunction
-
 always_ff @(posedge clk) begin
     if (reset_synced == 1'b0) begin
         reset();
     end else begin
+        // Default: the window bases follow varint_offset (overridden below
+        // wherever varint_offset itself is written).
+        vbase_r <= refresh_r;
+        for (int k = 0; k < 4; k++) begin
+            vbase_m[k] <= refresh_m[k];
+        end
+
         if (in.ready && in.valid) begin
             store_input();
         end
@@ -555,11 +824,18 @@ always_ff @(posedge clk) begin
                     offset <= conf_data.offset;
                     varint_offset <= conf_data.offset;
                     remaining_values <= conf_data.num_values;
-                    
+                    // Window bases for varint_offset = conf offset under the new configuration.
+                    vbase_r <= conf_data.offset + offset_t'(4'((32'(conf_data.bit_width) + 7) >> 3)) + 7'd1;
+                    vbase_m[0] <= conf_data.offset + 7'd1;
+                    vbase_m[1] <= conf_data.offset + offset_t'(conf_data.bit_width) + 7'd1;
+                    vbase_m[2] <= conf_data.offset + offset_t'(2 * conf_data.bit_width) + 7'd1;
+                    vbase_m[3] <= conf_data.offset + offset_t'(3 * conf_data.bit_width) + 7'd1;
+                    bw_x3 <= offset_t'(3 * conf_data.bit_width);
+
                     if (in.valid) begin
                         state <= ST_HEADER2;
-                        update_varint_data(in.data, conf_data.offset);
-                        varint_in.valid <= next_varint_valid(in.keep, in.last, conf_data.offset);
+                        varint_in.data <= win_in;
+                        varint_in.valid <= win_in_valid;
                     end else begin
                         state <= ST_HEADER;
                     end
@@ -571,8 +847,8 @@ always_ff @(posedge clk) begin
             // enough.
             ST_HEADER: begin
                 if (in.valid) begin
-                    update_varint_data(in.data, varint_offset);
-                    varint_in.valid <= next_varint_valid(in.keep, in.last, varint_offset);
+                    varint_in.data <= win_in;
+                    varint_in.valid <= win_in_valid;
                     // If we receive input, the varint decoding is not yet done
                     // as it takes one cycle. Move to the next state so that
                     // we can optionally take even more input if needed for
@@ -587,8 +863,8 @@ always_ff @(posedge clk) begin
                 if (varint_out.valid) begin
                     goto_decode(remaining_values);
                 end else if (in.valid) begin
-                    update_varint_data(next_data, varint_offset);
-                    varint_in.valid <= next_varint_valid(next_keep, next_last_received, varint_offset);
+                    varint_in.data <= win_next;
+                    varint_in.valid <= win_next_valid;
                 end
             end
 
@@ -637,9 +913,12 @@ localparam FIFO_DEPTH = MAX_IN_TRANSIT * 8;
 
 logic fifo_out_ready;
 logic[$clog2(FIFO_DEPTH):0] filling_level;
+// Distributed RAM: the read data is a flop next to the logic it selects (a RAMB18 read was the start of
+// the original's worst hybrid path, decoder-timing-floor-01 paths #6-8); a 64 x 1 FIFO fills one LUT pair.
 MehdiFIFO #(
     .DEPTH(FIFO_DEPTH),
-    .WIDTH($bits(output_t))
+    .WIDTH($bits(output_t)),
+    .STYLE("distributed")
 ) inst_output_fifo (
     .i_clk(clk),
     .i_rst_n(reset_synced),

@@ -117,6 +117,22 @@ StringPageFramer #(DATABEAT_SIZE) inst_string_page_framer (
 // ------ Hybrid decoder + dictionary wiring ------
 data_i #(data32_t) hybrid_conf(clk, reset_synced);
 
+// Register slice between the input demultiplexer and the HybridPageDecoder. Without it the decompressor
+// output select (fo=583) and its skid buffers' valid flops reached the RunDecoder's varint registers
+// through the decompressor mux, this demultiplexer and the hybrid gating in one cycle (8-9 levels,
+// -0.130 ns, diag-decoder-d0hse-timing-03), and the RunDecoder's in.ready ran back to the
+// decompressor's conf duplicator and skid buffers (11-12 levels, -0.068 / -0.021 ns). The libstf skid
+// buffer registers both directions, keeps order and passes one beat per cycle; HybridPageDecoder sees
+// the same beat sequence, later by at least one cycle.
+ndata_i #(data8_t, DATABEAT_SIZE) hybrid_in(clk, reset_synced);
+NDataSkidBuffer #(data8_t, DATABEAT_SIZE) inst_hybrid_in_slice (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .in(ins[IN_HYBRID]),
+    .out(hybrid_in)
+);
+
 ndata_i #(id_t, NUM_IDS) dict_ids(clk, reset_synced);
 HybridPageDecoder #(
     .data_t(id_t),
@@ -127,7 +143,7 @@ HybridPageDecoder #(
     .rst_n(reset_synced),
 
     .conf(hybrid_conf),
-    .in(ins[IN_HYBRID]),
+    .in(hybrid_in),
 
     .out(dict_ids)
 );

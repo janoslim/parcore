@@ -88,7 +88,10 @@ assign in_inner.ready = normalizer_in.ready && ~unconfigured;
 assign normalizer_in.valid = in_inner.valid && ~unconfigured;
 assign normalizer_in.data = in_inner.data;
 assign normalizer_in.keep = in_inner.keep;
-assign normalizer_in.last = in_inner.last && next_remaining == 0;
+// remaining - in_num_values is zero exactly when the two are equal (in_num_values zero-extends), so
+// `last` compares instead of the subtract (RunDecoderTiming, findings.md section 11.6; the typed
+// module below also carries the beat's byte count through its input skid, DualIssueRecovery's nu1).
+assign normalizer_in.last = in_inner.last && remaining == size_t'(in_num_values);
 
 endmodule
 
@@ -128,7 +131,23 @@ ndata_i #(data8_t, DATABEAT_SIZE) untyped_in(clk, reset_synced), in_inner(clk, r
 
 // This is on purpose 1 bit wider to account for the case where keep is 0xf..f
 logic [$clog2(DATABEAT_SIZE):0] in_num_bytes;
-assign in_num_bytes = $countones(in_inner.keep);
+
+// 200 MHz restructure (dpu-smartssd-olap 20261005-decoder-timing-fix-01, findings.md section 10).
+// The byte count of a beat used to be $countones(in_inner.keep) on the skid buffer's output, so
+// skid output mux -> 64-bit popcount -> /1,/4,/8 -> 32-bit compare -> last -> the DataNormalizer
+// offset reset was one 12-level path (proxy rd-proxy/hse_r4_rd1-02: +0.029 ns, the composite's
+// worst). The popcount is now taken at the skid buffer's input and carried with the beat, so after
+// the skid it is a register read; the skid buffer is the same libstf SkidBuffer that
+// NDataSkidBuffer wraps, with the count as one more field.
+typedef logic [$clog2(DATABEAT_SIZE):0] count_t;
+typedef struct packed {
+    data8_t[DATABEAT_SIZE - 1:0] data;
+    logic[DATABEAT_SIZE - 1:0]   keep;
+    logic                        last;
+    count_t                      count;
+} in_beat_t;
+ready_valid_i #(in_beat_t) in_skid_in(clk, reset_synced), in_skid_out(clk, reset_synced);
+assign in_num_bytes = in_skid_out.data.count;
 
 logic [$clog2(DATABEAT_SIZE):0] in_num_values;
 
@@ -194,9 +213,12 @@ always_ff @(posedge clk) begin
     end
 end
 
+// The type FIFO is 8 x 3; Vivado maps it to a RAMB18 unless told otherwise (Synth 8-7082 suggests
+// distributed RAM). MehdiFIFO's behaviour does not depend on STYLE.
 MehdiFIFO #(
     .DEPTH(MAX_IN_TRANSIT),
-    .WIDTH($bits(type_t))
+    .WIDTH($bits(type_t)),
+    .STYLE("distributed")
 ) inst_type_fifo (
     .i_clk(clk),
     .i_rst_n(reset_synced),
@@ -214,19 +236,36 @@ MehdiFIFO #(
 
 `DATA_ASSIGN(in, untyped_in);
 
-NDataSkidBuffer #(data8_t, DATABEAT_SIZE) inst_in_skid_buffer  (
+assign in_skid_in.data.data  = untyped_in.data;
+assign in_skid_in.data.keep  = untyped_in.keep;
+assign in_skid_in.data.last  = untyped_in.last;
+assign in_skid_in.data.count = $countones(untyped_in.keep);
+assign in_skid_in.valid      = untyped_in.valid;
+assign untyped_in.ready      = in_skid_in.ready;
+
+SkidBuffer #(
+    .data_t(in_beat_t)
+) inst_in_skid_buffer (
     .clk(clk),
     .rst_n(reset_synced),
 
-    .in(untyped_in),
-    .out(in_inner)
+    .in(in_skid_in),
+    .out(in_skid_out)
 );
+
+assign in_inner.data     = in_skid_out.data.data;
+assign in_inner.keep     = in_skid_out.data.keep;
+assign in_inner.last     = in_skid_out.data.last;
+assign in_inner.valid    = in_skid_out.valid;
+assign in_skid_out.ready = in_inner.ready;
 
 assign in_inner.ready = normalizer_in.ready && ~unconfigured;
 assign normalizer_in.valid = in_inner.valid && ~unconfigured;
 assign normalizer_in.data = in_inner.data;
 assign normalizer_in.keep = in_inner.keep;
-assign normalizer_in.last = in_inner.last && next_remaining == 0;
+// remaining - in_num_values is zero exactly when the two are equal (in_num_values is at most
+// DATABEAT_SIZE and is zero-extended), so `last` compares instead of waiting on the subtract.
+assign normalizer_in.last = in_inner.last && remaining == size_t'(in_num_values);
 
 DataNormalizer #(
     .data_t(data8_t),
