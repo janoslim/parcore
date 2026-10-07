@@ -92,16 +92,39 @@ offset_t varint_offset;
 // goto_decode(), which writes them.
 logic bvb_r, rvb_r;
 // vbase_r    == varint_offset + 1 + rle_width     (mod 128)
-// vbase_m[k] == varint_offset + 1 + k * bit_width (mod 128), k = 0..3
+// vbase_m[k] == varint_offset + 1 + k * bit_width (mod 128), k = 1, 2
 // A run that starts right after the varint at varint_offset is followed by the next varint at
 // varint_offset + length + payload, with payload rle_width (RLE) or k * bit_width (a bit-packed run of
-// k <= 3 groups, the only one goto_decode_bpe() reads ahead for). As flops, these bases let the
-// next-varint window be read from registers while the decoded length selects inside it afterwards.
-// They follow varint_offset every cycle except the one cycle after goto_decode_bpe() enters a run with
-// two or more 16-value inputs left, when no window read can happen.
+// k groups). As flops, these bases let the next-varint window be read from registers while the decoded
+// length selects inside it afterwards. They follow varint_offset every cycle except the one cycle after
+// goto_decode_bpe() enters a run that does not prefetch its next header, when no window read can happen.
+// rd6 (findings.md section 13): only k = 1, 2 remain. rd5 also kept k = 0 and k = 3, but their prefetch
+// was never consumed: a 0-group run never decodes (bpe_count stays 0, so bpe_in.valid stays low), and a
+// 3-group run (24 values, one full input plus one) re-reads its next header at its first input
+// (advance_bpe(), bpe_remaining_inputs == 1) before finish_bpe() can look at it.
 offset_t vbase_r;
-offset_t vbase_m[4];
-offset_t bw_x3; // 3 * bit_width mod 128, captured with the configuration
+offset_t vbase_m[1:2];
+// gbase_r == the base goto_decode() reads the next header at, for the varint held in varint_in.data:
+//     value[0] (bit-packed) ? (value[1] ? vbase_m[1] : vbase_m[2]) : vbase_r
+// (value[2:1] is the group count of a bit-packed run; only 1 and 2 prefetch, see vbase_m).
+// rd6, v09 full-design link (run-v09-v2-rd5-01, 17 endpoints data_reg[0][2]__0 -> data_reg[*][*]__0/D,
+// 10-12 levels, worst -0.228 ns): rd5 selected this base combinationally from varint_in.data and the vbase
+// flops (LUT6 + LUT3 with fanout 148) in front of the 128:1 window mux, so the recurrence varint_in.data ->
+// varint_in.data held the select, the mux, and the length and state-machine selection in one cycle. The
+// select is retimed across the registers here: it is computed from the next values of varint_in.data and
+// vbase_* (the *_n variables below) and registered, so the window mux reads a flop directly. Every write
+// of varint_in or vbase_* now writes its *_n variable and the flops take them at the end of the clocked
+// block, so the values, and the ports, are those of rd5 cycle for cycle.
+offset_t gbase_r;
+// Next values of varint_in and vbase_*: blocking variables, written only inside the clocked block below
+// and the tasks it calls, and read only at its end (no flop is inferred for them). vin_goto_n marks that
+// goto_decode() prefetches the next header from the window at gbase_r in this cycle (vin_goto_ok_n: and
+// may mark it valid). It is applied last, so the window enters the D logic of varint_in at a final 2:1
+// select instead of under the state machine's priority chain.
+data8_t[3:0] vin_data_n;
+logic vin_valid_n, vin_goto_n, vin_goto_ok_n;
+offset_t vb_r_n;
+offset_t vb_m_n[1:2];
 
 // ------- Output declaration -----
 typedef enum logic {
@@ -394,14 +417,17 @@ assign win_at1_valid = win_at1_keep[0] && (last_received || &win_at1_keep[3:1]);
 assign win_next_valid = win_next_keep[0] && (next_last_received || &win_next_keep[3:1]);
 
 // goto_decode(): the next varint starts at varint_offset + length + payload, i.e. at
-// goto_base + length - 1 with goto_base one of the registered vbase_*. The 7-byte window at goto_base
-// covers all four lengths; the length then picks 4 bytes out of it.
+// goto_base + length - 1 with goto_base the registered gbase_r (one of vbase_*, see its declaration). The
+// 7-byte window at goto_base covers all four lengths; the length then picks 4 bytes out of it.
 logic goto_bpe;
 logic[1:0] goto_groups;
+logic goto_prefetch_ok;
 assign goto_bpe = varint_out.data.value[0];    // == varint_encoding
 assign goto_groups = varint_out.data.value[2:1]; // 8-value groups when the run has <= 3 of them
+// rd6: a bit-packed run prefetches its next header only with 1 or 2 groups (see vbase_m).
+assign goto_prefetch_ok = goto_groups[1] ^ goto_groups[0];
 offset_t goto_base;
-assign goto_base = goto_bpe ? vbase_m[goto_groups] : vbase_r;
+assign goto_base = gbase_r;
 data8_t[6:0] goto_window;
 logic[6:0] goto_window_keep;
 assign goto_window = data_twice[goto_base +: 7];
@@ -411,12 +437,10 @@ assign goto_window_keep = keep_twice[goto_base +: 7];
 // next varint's index (goto_base + length - 1) with bit 6 cleared by trim_offset() for a bit-packed
 // run, or offset_after_varint's bit 6 removed for an RLE run (trim_offset(oav) + rle_width); adding the
 // base constants commutes with that bit flip mod 128.
-offset_t goto_sum_r, goto_sum_m[4];
+offset_t goto_sum_r, goto_sum_m[1:2];
 assign goto_sum_r = goto_base + offset_t'(rle_width);
-assign goto_sum_m[0] = goto_base;
 assign goto_sum_m[1] = goto_base + offset_t'(bit_width);
 assign goto_sum_m[2] = goto_base + offset_t'(2 * bit_width);
-assign goto_sum_m[3] = goto_base + bw_x3;
 
 data8_t[3:0] win_goto;
 logic win_goto_valid;
@@ -460,21 +484,19 @@ offset_t goto_index, goto_flip;
 assign goto_index = goto_base + offset_t'(varint_out.data.length) - 7'd1;
 assign goto_flip = {goto_bpe ? goto_index[$bits(offset_t) - 1] : goto_oav[$bits(offset_t) - 1],
                     {($bits(offset_t) - 1){1'b0}}};
-offset_t goto_new_r, goto_new_m[4];
+offset_t goto_new_r, goto_new_m[1:2];
 assign goto_new_r = (goto_sum_r + offset_t'(varint_out.data.length)) ^ goto_flip;
 generate
-for (genvar k = 0; k < 4; k++) begin : gen_goto_new
+for (genvar k = 1; k <= 2; k++) begin : gen_goto_new
     assign goto_new_m[k] = (goto_sum_m[k] + offset_t'(varint_out.data.length)) ^ goto_flip;
 end
 endgenerate
 
 // The bases implied by the current varint_offset; the default next value of vbase_*.
-offset_t refresh_r, refresh_m[4];
+offset_t refresh_r, refresh_m[1:2];
 assign refresh_r = varint_offset + offset_t'(rle_width) + 7'd1;
-assign refresh_m[0] = varint_offset + 7'd1;
 assign refresh_m[1] = varint_offset + offset_t'(bit_width) + 7'd1;
 assign refresh_m[2] = varint_offset + offset_t'(2 * bit_width) + 7'd1;
-assign refresh_m[3] = varint_offset + bw_x3 + 7'd1;
 
 
 // ------- Combinatorial input ---
@@ -534,9 +556,9 @@ task update_offset(input offset_t next_offset);
         if (varint_offset >= NUM_BYTES) begin
             varint_offset <= trim_offset(varint_offset);
             // varint_offset - NUM_BYTES flips bit 6 of every mod-128 base derived from it.
-            vbase_r <= refresh_r ^ offset_t'(NUM_BYTES);
-            for (int k = 0; k < 4; k++) begin
-                vbase_m[k] <= refresh_m[k] ^ offset_t'(NUM_BYTES);
+            vb_r_n = refresh_r ^ offset_t'(NUM_BYTES);
+            for (int k = 1; k <= 2; k++) begin
+                vb_m_n[k] = refresh_m[k] ^ offset_t'(NUM_BYTES);
             end
         end
     end
@@ -556,7 +578,7 @@ task reset();
     packed_databeat_bytes <= 'x;
     eight_packed_databeat_bytes <= 'x;
     varint_offset <= 'x;
-    varint_in.valid <= 0;
+    vin_valid_n = 1'b0;
     offset <= 'x;
     remaining_values <= 'x;
 
@@ -634,7 +656,7 @@ task goto_decode_bpe(
     varint_offset <= trim_offset(next_varint_offset);
     bpe_remaining_inputs <= next_bpe_remaining_inputs;
 
-    if (next_bpe_remaining_inputs <= 1) begin
+    if (next_bpe_remaining_inputs <= 1 && goto_prefetch_ok) begin
         // Here we use next_varint_offset (which may be > NUM_BYTES) as if
         // that's the case, in this databeat we also moved the offset forward
         // and shifted the data, so we store the varint_offset trimmed
@@ -642,24 +664,25 @@ task goto_decode_bpe(
         // match.
         // With at most one 16-value input, next_varint_offset is
         // offset_after_varint + groups * bit_width = goto_base + length - 1,
-        // the start of win_goto.
-        varint_in.data <= win_goto;
+        // the start of win_goto (written at the end of the clocked block, vin_goto_n).
+        vin_goto_n = 1'b1;
         // rd5 (findings.md section 12, B1): a header in the next beat of a buffer that does not shift in
         // this cycle (offset_after_varint < 64 <= next header) is not prefetched as valid. varint_offset is
         // stored trimmed just below, so finish_bpe() would otherwise consume it through goto_decode() with
         // an index 64 bytes short and re-point into the old beat; with valid low it takes its else-branch,
-        // which adds the +64 and shifts (one cycle more, on this shape only). A 3-group run re-reads the
-        // header at its first input (advance_bpe(), rem==1), so nothing reads this valid before then.
-        varint_in.valid <= win_goto_valid && !(goto_index[$bits(offset_t) - 1] && !goto_oav[$bits(offset_t) - 1]);
-        vbase_r <= goto_new_r;
-        for (int k = 0; k < 4; k++) begin
-            vbase_m[k] <= goto_new_m[k];
+        // which adds the +64 and shifts (one cycle more, on this shape only).
+        vin_goto_ok_n = !(goto_index[$bits(offset_t) - 1] && !goto_oav[$bits(offset_t) - 1]);
+        vb_r_n = goto_new_r;
+        for (int k = 1; k <= 2; k++) begin
+            vb_m_n[k] = goto_new_m[k];
         end
     end else begin
         // vbase_* take the default refresh from this cycle's varint_offset and
-        // are refreshed from the new one in the next cycle; this run has at
-        // least two inputs left, so no goto_decode() reads them in between.
-        varint_in.valid <= 0;
+        // are refreshed from the new one in the next cycle; no goto_decode()
+        // reads them in between: this run has at least two inputs left, or it
+        // is a 3-group run (advance_bpe() re-reads the header at its first
+        // input, rd6) or a 0-group run (never decodes, rd6).
+        vin_valid_n = 1'b0;
     end
 
     state <= ST_DECODE_BPE;
@@ -713,8 +736,8 @@ task advance_bpe();
         // offset and finish_bpe() re-reads it through its else-branch.
         next_varint_in_valid = increment_varint_offset ? win_at1_valid && next_offset >= NUM_BYTES : win_at0_valid;
 
-        varint_in.data <= increment_varint_offset ? win_at1 : win_at0;
-        varint_in.valid <= next_varint_in_valid;
+        vin_data_n = increment_varint_offset ? win_at1 : win_at0;
+        vin_valid_n = next_varint_in_valid;
 
         // We only want to store the offset if we haven't trimmed the input in
         // this cycle and if we haven't set a valid varint input already.
@@ -722,9 +745,9 @@ task advance_bpe();
         // already correct.
         if (~next_varint_in_valid && next_offset < NUM_BYTES) begin
             varint_offset <= actual_varint_offset;
-            vbase_r <= increment_varint_offset ? refresh_r ^ offset_t'(NUM_BYTES) : refresh_r;
-            for (int k = 0; k < 4; k++) begin
-                vbase_m[k] <= increment_varint_offset ? refresh_m[k] ^ offset_t'(NUM_BYTES) : refresh_m[k];
+            vb_r_n = increment_varint_offset ? refresh_r ^ offset_t'(NUM_BYTES) : refresh_r;
+            for (int k = 1; k <= 2; k++) begin
+                vb_m_n[k] = increment_varint_offset ? refresh_m[k] ^ offset_t'(NUM_BYTES) : refresh_m[k];
             end
         end
     end
@@ -758,8 +781,8 @@ task finish_bpe();
         // NOTE: this update here is needed as this last BPE decoding might
         // have involved receiving more input, meaning that the varint may now
         // be valid.
-        varint_in.data <= (varint_offset <= offset) ? win_at1 : win_at0;
-        varint_in.valid <= (varint_offset <= offset) ? win_at1_valid : win_at0_valid;
+        vin_data_n = (varint_offset <= offset) ? win_at1 : win_at0;
+        vin_valid_n = (varint_offset <= offset) ? win_at1_valid : win_at0_valid;
         update_offset(actual_varint_offset);
 
         // If ~varint_out.valid we need to fetch more input to
@@ -777,12 +800,13 @@ task goto_decode_rle(input offset_t offst);
     // the data will be shifted but only from the next cycle, so when indexing
     // data and keep to populate the varint decoder, we need to use the
     // current offset.
-    // offst + rle_width == goto_base + length - 1, the start of win_goto.
-    varint_in.data <= win_goto;
-    varint_in.valid <= win_goto_valid;
-    vbase_r <= goto_new_r;
-    for (int k = 0; k < 4; k++) begin
-        vbase_m[k] <= goto_new_m[k];
+    // offst + rle_width == goto_base + length - 1, the start of win_goto (written at the end of the
+    // clocked block, vin_goto_n).
+    vin_goto_n = 1'b1;
+    vin_goto_ok_n = 1'b1;
+    vb_r_n = goto_new_r;
+    for (int k = 1; k <= 2; k++) begin
+        vb_m_n[k] = goto_new_m[k];
     end
 endtask
 
@@ -808,21 +832,31 @@ task finish_rle();
         // so ST_HEADER2 takes input only if the header really is incomplete. The
         // pinned decoder kept the stale prefetch, and ST_HEADER2 then stored one more
         // beat into the half still in use, which the next shift dropped.
-        varint_in.data <= win_at0;
-        varint_in.valid <= win_at0_valid;
+        vin_data_n = win_at0;
+        vin_valid_n = win_at0_valid;
         state <= ST_HEADER2;
     end
 endtask
 
 always_ff @(posedge clk) begin
+    // Next values of varint_in and vbase_* (see vin_data_n): hold unless written below.
+    vin_data_n = varint_in.data;
+    vin_valid_n = varint_in.valid;
+    vin_goto_n = 1'b0;
+    vin_goto_ok_n = 1'b0;
+    vb_r_n = vbase_r;
+    for (int k = 1; k <= 2; k++) begin
+        vb_m_n[k] = vbase_m[k];
+    end
+
     if (reset_synced == 1'b0) begin
         reset();
     end else begin
         // Default: the window bases follow varint_offset (overridden below
         // wherever varint_offset itself is written).
-        vbase_r <= refresh_r;
-        for (int k = 0; k < 4; k++) begin
-            vbase_m[k] <= refresh_m[k];
+        vb_r_n = refresh_r;
+        for (int k = 1; k <= 2; k++) begin
+            vb_m_n[k] = refresh_m[k];
         end
 
         if (in.ready && in.valid) begin
@@ -842,17 +876,14 @@ always_ff @(posedge clk) begin
                     varint_offset <= conf_data.offset;
                     remaining_values <= conf_data.num_values;
                     // Window bases for varint_offset = conf offset under the new configuration.
-                    vbase_r <= conf_data.offset + offset_t'(4'((32'(conf_data.bit_width) + 7) >> 3)) + 7'd1;
-                    vbase_m[0] <= conf_data.offset + 7'd1;
-                    vbase_m[1] <= conf_data.offset + offset_t'(conf_data.bit_width) + 7'd1;
-                    vbase_m[2] <= conf_data.offset + offset_t'(2 * conf_data.bit_width) + 7'd1;
-                    vbase_m[3] <= conf_data.offset + offset_t'(3 * conf_data.bit_width) + 7'd1;
-                    bw_x3 <= offset_t'(3 * conf_data.bit_width);
+                    vb_r_n = conf_data.offset + offset_t'(4'((32'(conf_data.bit_width) + 7) >> 3)) + 7'd1;
+                    vb_m_n[1] = conf_data.offset + offset_t'(conf_data.bit_width) + 7'd1;
+                    vb_m_n[2] = conf_data.offset + offset_t'(2 * conf_data.bit_width) + 7'd1;
 
                     if (in.valid) begin
                         state <= ST_HEADER2;
-                        varint_in.data <= win_in;
-                        varint_in.valid <= win_in_valid;
+                        vin_data_n = win_in;
+                        vin_valid_n = win_in_valid;
                     end else begin
                         state <= ST_HEADER;
                     end
@@ -864,8 +895,8 @@ always_ff @(posedge clk) begin
             // enough.
             ST_HEADER: begin
                 if (in.valid) begin
-                    varint_in.data <= win_in;
-                    varint_in.valid <= win_in_valid;
+                    vin_data_n = win_in;
+                    vin_valid_n = win_in_valid;
                     // If we receive input, the varint decoding is not yet done
                     // as it takes one cycle. Move to the next state so that
                     // we can optionally take even more input if needed for
@@ -880,8 +911,8 @@ always_ff @(posedge clk) begin
                 if (varint_out.valid) begin
                     goto_decode(remaining_values);
                 end else if (in.valid) begin
-                    varint_in.data <= win_next;
-                    varint_in.valid <= win_next_valid;
+                    vin_data_n = win_next;
+                    vin_valid_n = win_next_valid;
                 end
             end
 
@@ -901,6 +932,20 @@ always_ff @(posedge clk) begin
                 end
             end
         endcase
+    end
+
+    // The registers behind the *_n variables. The goto window is applied last (vin_goto_n), and gbase_r is
+    // the base select on the values these registers take (see its declaration).
+    varint_in.data <= vin_goto_n ? win_goto : vin_data_n;
+    varint_in.valid <= vin_goto_n ? win_goto_valid && vin_goto_ok_n : vin_valid_n;
+    vbase_r <= vb_r_n;
+    for (int k = 1; k <= 2; k++) begin
+        vbase_m[k] <= vb_m_n[k];
+    end
+    if (vin_goto_n ? win_goto[0][0] : vin_data_n[0][0]) begin
+        gbase_r <= (vin_goto_n ? win_goto[0][1] : vin_data_n[0][1]) ? vb_m_n[1] : vb_m_n[2];
+    end else begin
+        gbase_r <= vb_r_n;
     end
 end
 
