@@ -131,6 +131,18 @@ data8_t[3:0] vin_d;
 logic vin_valid_n, vin_goto_n, vin_goto_ok_n;
 offset_t vb_r_n;
 offset_t vb_m_n[1:2];
+// rd8: the configuration cycle (ST_IDLE taking conf) writes vbase_* and gbase_r from conf_data alone. Its
+// bit width is HybridPageDecoder's byte select on the input beat, so these are the latest values of the
+// cycle (rd7 proxy: input slice head -> bit width -> vbase_m source mux -> base select -> gbase_r, 11
+// levels, +0.221 ns, rd-proxy/hse_r4_rd7-01). They are computed here as their own terms and enter the
+// registers at a final 2:1 select (cfg_n) instead of under the vbase source mux and then the base select.
+// The configuration cycle writes no other base (no offset update or goto happens in ST_IDLE), so the
+// registers take the same values as before.
+logic cfg_n;
+offset_t vb_r_cfg, vb_m1_cfg, vb_m2_cfg;
+assign vb_r_cfg = conf_data.offset + offset_t'(4'((32'(conf_data.bit_width) + 7) >> 3)) + 7'd1;
+assign vb_m1_cfg = conf_data.offset + offset_t'(conf_data.bit_width) + 7'd1;
+assign vb_m2_cfg = conf_data.offset + offset_t'(2 * conf_data.bit_width) + 7'd1;
 
 // ------- Output declaration -----
 typedef enum logic {
@@ -852,6 +864,7 @@ always_ff @(posedge clk) begin
     vin_at1_n = 1'b0;
     vin_in_n = 1'b0;
     vin_next_n = 1'b0;
+    cfg_n = 1'b0;
     vin_valid_n = varint_in.valid;
     vin_goto_n = 1'b0;
     vin_goto_ok_n = 1'b0;
@@ -886,10 +899,9 @@ always_ff @(posedge clk) begin
                     offset <= conf_data.offset;
                     varint_offset <= conf_data.offset;
                     remaining_values <= conf_data.num_values;
-                    // Window bases for varint_offset = conf offset under the new configuration.
-                    vb_r_n = conf_data.offset + offset_t'(4'((32'(conf_data.bit_width) + 7) >> 3)) + 7'd1;
-                    vb_m_n[1] = conf_data.offset + offset_t'(conf_data.bit_width) + 7'd1;
-                    vb_m_n[2] = conf_data.offset + offset_t'(2 * conf_data.bit_width) + 7'd1;
+                    // Window bases for varint_offset = conf offset under the new configuration (vb_*_cfg,
+                    // applied at the end of this block).
+                    cfg_n = 1'b1;
 
                     if (in.valid) begin
                         state <= ST_HEADER2;
@@ -952,14 +964,21 @@ always_ff @(posedge clk) begin
             | ({32{!(vin_goto_n || vin_at0_n || vin_at1_n || vin_in_n || vin_next_n)}} & varint_in.data);
     varint_in.data <= vin_d;
     varint_in.valid <= vin_goto_n ? win_goto_valid && vin_goto_ok_n : vin_valid_n;
-    vbase_r <= vb_r_n;
-    for (int k = 1; k <= 2; k++) begin
-        vbase_m[k] <= vb_m_n[k];
-    end
-    if (vin_d[0][0]) begin
-        gbase_r <= vin_d[0][1] ? vb_m_n[1] : vb_m_n[2];
+    if (cfg_n) begin
+        vbase_r <= vb_r_cfg;
+        vbase_m[1] <= vb_m1_cfg;
+        vbase_m[2] <= vb_m2_cfg;
+        gbase_r <= vin_d[0][0] ? (vin_d[0][1] ? vb_m1_cfg : vb_m2_cfg) : vb_r_cfg;
     end else begin
-        gbase_r <= vb_r_n;
+        vbase_r <= vb_r_n;
+        for (int k = 1; k <= 2; k++) begin
+            vbase_m[k] <= vb_m_n[k];
+        end
+        if (vin_d[0][0]) begin
+            gbase_r <= vin_d[0][1] ? vb_m_n[1] : vb_m_n[2];
+        end else begin
+            gbase_r <= vb_r_n;
+        end
     end
 end
 
