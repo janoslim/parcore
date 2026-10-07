@@ -59,9 +59,15 @@ tagged_i #(input_t, $bits(bpe_config_t)) in_inner(clk, rst_n);
 bpe_stage_i #(input_t, bpe_config_t, data_t, NUM_ELEMENTS) middle[N_STAGES:0]();
 
 // some stages of buffering are required for full throughput in RunDecoder
+// Distributed RAM instead of the default RAMB: 8 entries need 26 RAM32M16 next to the RunDecoder,
+// so the write data (RunDecoder's 64:1 byte shift) no longer routes 1.6-1.7 ns to a BRAM column
+// (diag-decoder-d0hse-timing-03: data_reg -> s_memory_reg_*/DINADIN, 4 levels, -0.065 ns) and the
+// read data feeding stage 0's shift is a flop instead of a RAMB clock-to-out (proxy decoder-hse_r2-01:
+// s_memory_reg_0 -> stage data_reg, -0.100 ns). MehdiFIFO's behaviour does not depend on STYLE.
 MehdiFIFO #(
     .DEPTH(MAX_IN_TRANSIT),
-    .WIDTH($bits(input_t) + $bits(bpe_config_t) + 1 + 1)
+    .WIDTH($bits(input_t) + $bits(bpe_config_t) + 1 + 1),
+    .STYLE("distributed")
 ) inst_output_fifo (
     .i_clk(clk),
     .i_rst_n(rst_n),
