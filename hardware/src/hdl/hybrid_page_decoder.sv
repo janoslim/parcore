@@ -44,6 +44,8 @@ logic       seen_last;
 // ------- Run decoder wiring ------
 ndata_i #(data8_t, NUM_BYTES)   run_decoder_in(clk, reset_synced);
 ndata_i #(data_t, NUM_ELEMENTS) out_inner(clk, reset_synced);
+// RunDecoder output ahead of inst_run_out_slice.
+ndata_i #(data_t, NUM_ELEMENTS) run_out(clk, reset_synced);
 // out_inner with per-page `last` masked when the page is not the last one (conf.last).
 ndata_i #(data_t, NUM_ELEMENTS) out_masked(clk, reset_synced);
 
@@ -63,6 +65,20 @@ RunDecoder #(data_t, NUM_ELEMENTS, NUM_BYTES) inst_run_decoder (
     .in(run_decoder_in),
     .conf(run_decoder_conf),
 
+    .out(run_out)
+);
+
+// Register slice between the RunDecoder output FIFO and the page state machine. Without it the
+// FIFO's RAMB18 read data selects rle_out/bpe_out keep, which feeds $countones -> 32-bit subtract
+// -> ==0 -> the bit_width_offset CE inside one 5.0 ns cycle; post-route that path failed at
+// -0.626 ns (decoder-timing-floor-01/findings.md:78-80, paths #6-8). The slice is lossless and
+// order-preserving at one beat per cycle, and the state machine already tolerates arbitrary output
+// latency because the RunDecoder FIFO sits on the same path.
+NDataSkidBuffer #(data_t, NUM_ELEMENTS) inst_run_out_slice (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .in(run_out),
     .out(out_inner)
 );
 
@@ -99,6 +115,12 @@ offset_t actual_offset, next_offset;
 assign actual_offset = NUM_BYTES_OFFSET + in.data[NUM_BYTES_OFFSET - 1:0];
 assign next_offset = offset - NUM_BYTES;
 assign next_num_values = num_values - out_num_values;
+// num_values - out_num_values is zero exactly when the two are equal (out_num_values is at most
+// NUM_ELEMENTS and is zero-extended), so the state machine compares instead of waiting on the
+// subtract's 32-bit carry chain. With inst_run_out_slice in place that chain was still the
+// bit_width_offset CE path's 13 logic levels post-route (-0.183 ns, diag-decoder-d0hs-01).
+logic page_values_done;
+assign page_values_done = num_values == 32'(out_num_values);
 
 task reset();
     state <= ST_IDLE;
@@ -185,7 +207,7 @@ always_ff @(posedge clk) begin
                 if (out_inner.ready && out_inner.valid) begin
                     num_values <= next_num_values;
 
-                    if (next_num_values == 0) begin
+                    if (page_values_done) begin
                         // The RunDecoder stops after num_values, but a BPE page
                         // is padded to whole runs (e.g. multiples of 256), so
                         // the final input databeat(s) may carry trailing
@@ -225,7 +247,7 @@ end
 // exhausted, and only on the last page of the hybrid-page group (page_last).
 // The dummy reset beat is a single empty last beat injected directly.
 logic page_exhausted;
-assign page_exhausted = next_num_values == 0;
+assign page_exhausted = page_values_done;
 
 always_comb begin
     out_masked.data  = out_inner.data;
