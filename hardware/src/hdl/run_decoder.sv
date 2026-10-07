@@ -121,7 +121,13 @@ offset_t gbase_r;
 // goto_decode() prefetches the next header from the window at gbase_r in this cycle (vin_goto_ok_n: and
 // may mark it valid). It is applied last, so the window enters the D logic of varint_in at a final 2:1
 // select instead of under the state machine's priority chain.
-data8_t[3:0] vin_data_n;
+// rd7: the data source of varint_in is a one-hot set of flags (at0, at1, in, next, goto; none = hold) and
+// the register's D input is their AND-OR, so each window enters it two LUT levels from the D pin instead of
+// under the state machine's priority chain (rd6 proxy: varint_offset -> window -> 4-5 select levels,
+// +0.333 ns, rd-analysis/v09-hse_r4_rd6-01). At most one flag is set per cycle (the branches that set them
+// exclude each other), so the AND-OR selects exactly what the if/case chain did.
+logic vin_at0_n, vin_at1_n, vin_in_n, vin_next_n;
+data8_t[3:0] vin_d;
 logic vin_valid_n, vin_goto_n, vin_goto_ok_n;
 offset_t vb_r_n;
 offset_t vb_m_n[1:2];
@@ -736,7 +742,8 @@ task advance_bpe();
         // offset and finish_bpe() re-reads it through its else-branch.
         next_varint_in_valid = increment_varint_offset ? win_at1_valid && next_offset >= NUM_BYTES : win_at0_valid;
 
-        vin_data_n = increment_varint_offset ? win_at1 : win_at0;
+        vin_at1_n = increment_varint_offset;
+        vin_at0_n = !increment_varint_offset;
         vin_valid_n = next_varint_in_valid;
 
         // We only want to store the offset if we haven't trimmed the input in
@@ -781,7 +788,8 @@ task finish_bpe();
         // NOTE: this update here is needed as this last BPE decoding might
         // have involved receiving more input, meaning that the varint may now
         // be valid.
-        vin_data_n = (varint_offset <= offset) ? win_at1 : win_at0;
+        vin_at1_n = varint_offset <= offset;
+        vin_at0_n = !(varint_offset <= offset);
         vin_valid_n = (varint_offset <= offset) ? win_at1_valid : win_at0_valid;
         update_offset(actual_varint_offset);
 
@@ -832,15 +840,18 @@ task finish_rle();
         // so ST_HEADER2 takes input only if the header really is incomplete. The
         // pinned decoder kept the stale prefetch, and ST_HEADER2 then stored one more
         // beat into the half still in use, which the next shift dropped.
-        vin_data_n = win_at0;
+        vin_at0_n = 1'b1;
         vin_valid_n = win_at0_valid;
         state <= ST_HEADER2;
     end
 endtask
 
 always_ff @(posedge clk) begin
-    // Next values of varint_in and vbase_* (see vin_data_n): hold unless written below.
-    vin_data_n = varint_in.data;
+    // Next values of varint_in and vbase_* (see vin_valid_n, vin_at0_n): hold unless written below.
+    vin_at0_n = 1'b0;
+    vin_at1_n = 1'b0;
+    vin_in_n = 1'b0;
+    vin_next_n = 1'b0;
     vin_valid_n = varint_in.valid;
     vin_goto_n = 1'b0;
     vin_goto_ok_n = 1'b0;
@@ -882,7 +893,7 @@ always_ff @(posedge clk) begin
 
                     if (in.valid) begin
                         state <= ST_HEADER2;
-                        vin_data_n = win_in;
+                        vin_in_n = 1'b1;
                         vin_valid_n = win_in_valid;
                     end else begin
                         state <= ST_HEADER;
@@ -895,7 +906,7 @@ always_ff @(posedge clk) begin
             // enough.
             ST_HEADER: begin
                 if (in.valid) begin
-                    vin_data_n = win_in;
+                    vin_in_n = 1'b1;
                     vin_valid_n = win_in_valid;
                     // If we receive input, the varint decoding is not yet done
                     // as it takes one cycle. Move to the next state so that
@@ -911,7 +922,7 @@ always_ff @(posedge clk) begin
                 if (varint_out.valid) begin
                     goto_decode(remaining_values);
                 end else if (in.valid) begin
-                    vin_data_n = win_next;
+                    vin_next_n = 1'b1;
                     vin_valid_n = win_next_valid;
                 end
             end
@@ -936,14 +947,17 @@ always_ff @(posedge clk) begin
 
     // The registers behind the *_n variables. The goto window is applied last (vin_goto_n), and gbase_r is
     // the base select on the values these registers take (see its declaration).
-    varint_in.data <= vin_goto_n ? win_goto : vin_data_n;
+    vin_d = ({32{vin_goto_n}} & win_goto) | ({32{vin_at0_n}} & win_at0) | ({32{vin_at1_n}} & win_at1)
+            | ({32{vin_in_n}} & win_in) | ({32{vin_next_n}} & win_next)
+            | ({32{!(vin_goto_n || vin_at0_n || vin_at1_n || vin_in_n || vin_next_n)}} & varint_in.data);
+    varint_in.data <= vin_d;
     varint_in.valid <= vin_goto_n ? win_goto_valid && vin_goto_ok_n : vin_valid_n;
     vbase_r <= vb_r_n;
     for (int k = 1; k <= 2; k++) begin
         vbase_m[k] <= vb_m_n[k];
     end
-    if (vin_goto_n ? win_goto[0][0] : vin_data_n[0][0]) begin
-        gbase_r <= (vin_goto_n ? win_goto[0][1] : vin_data_n[0][1]) ? vb_m_n[1] : vb_m_n[2];
+    if (vin_d[0][0]) begin
+        gbase_r <= vin_d[0][1] ? vb_m_n[1] : vb_m_n[2];
     end else begin
         gbase_r <= vb_r_n;
     end

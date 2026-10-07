@@ -128,8 +128,12 @@ data_i #(data32_t) hybrid_conf(clk, reset_synced);
 // decompressor's conf duplicator and skid buffers (11-12 levels, -0.068 / -0.021 ns). The libstf skid
 // buffer registers both directions, keeps order and passes one beat per cycle; HybridPageDecoder sees
 // the same beat sequence, later by at least one cycle.
+// rd7 (findings.md section 13): NDataRegSlice (end of this file) is the same two-entry FIFO with its output
+// taken from a register. In the rd6 proxy the libstf skid's output mux (its valid replica, fanout 0.88 ns,
+// then the data LUT, 0.85 ns) started the RunDecoder's worst paths: the configuration cycle's bit width
+// (Hybrid's 64:1 byte select) into the window bases, +0.015 ns, 11 levels (rd-proxy/hse_r4_rd6-01).
 ndata_i #(data8_t, DATABEAT_SIZE) hybrid_in(clk, reset_synced);
-NDataSkidBuffer #(data8_t, DATABEAT_SIZE) inst_hybrid_in_slice (
+NDataRegSlice #(data8_t, DATABEAT_SIZE) inst_hybrid_in_slice (
     .clk(clk),
     .rst_n(reset_synced),
 
@@ -640,5 +644,67 @@ assign out.data = slice_out.data.data;
 assign out.typ  = slice_out.data.typ;
 assign out.keep = slice_out.data.keep;
 assign out.last = force_last;
+
+endmodule
+
+// rd7 (decoder-timing-fix findings.md section 13). libstf's NDataSkidBuffer is a two-entry FIFO: in.ready is
+// "not full" from flops, out shows the oldest entry, and a beat is accepted and the oldest consumed in the
+// same cycle when both handshakes fire. Its output is a mux of its two registers selected by one of their
+// valid flops, so every reader of out.data sits behind that select's fanout and the mux LUT. This keeps
+// the same occupancy, order and handshakes (in.ready, out.valid and out.data equal NDataSkidBuffer's in
+// every cycle) but holds the oldest entry in `head`, a register read directly by out.data; the mux moves
+// in front of head's D input.
+module NDataRegSlice #(
+    parameter type data_t,
+    parameter NUM_ELEMENTS
+) (
+    input logic clk,
+    input logic rst_n,
+
+    ndata_i.s in, // #(data_t, NUM_ELEMENTS)
+    ndata_i.m out // #(data_t, NUM_ELEMENTS)
+);
+
+typedef struct packed {
+    data_t[NUM_ELEMENTS - 1:0] data;
+    logic[NUM_ELEMENTS - 1:0]  keep;
+    logic                      last;
+} beat_t;
+
+beat_t head, tail, in_beat;
+logic head_valid, tail_valid;
+logic accept;
+
+assign in_beat = '{data: in.data, keep: in.keep, last: in.last};
+assign in.ready = !(head_valid && tail_valid);
+assign accept = in.valid && !(head_valid && tail_valid);
+
+always_ff @(posedge clk) begin
+    if (!rst_n) begin
+        head_valid <= 1'b0;
+        tail_valid <= 1'b0;
+    end else begin
+        if (!head_valid || out.ready) begin
+            // The head is free after this cycle: it takes the older of the tail and the incoming beat.
+            if (tail_valid) begin
+                head <= tail;
+                head_valid <= 1'b1;
+                tail <= in_beat;
+                tail_valid <= accept;
+            end else begin
+                head <= in_beat;
+                head_valid <= accept;
+            end
+        end else if (accept) begin
+            tail <= in_beat;
+            tail_valid <= 1'b1;
+        end
+    end
+end
+
+assign out.data  = head.data;
+assign out.keep  = head.keep;
+assign out.last  = head.last;
+assign out.valid = head_valid;
 
 endmodule
