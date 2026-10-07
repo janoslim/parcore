@@ -6,7 +6,7 @@
 	url = https://github.com/apache/arrow.git
 [submodule "libstf"]
 	path = libstf
-	url = https://github.com/fpgasystems/libstf.git
+	url = https://github.com/janoslim/libstf.git
 [submodule "vhsnunzip"]
 	path = vhsnunzip
-	url = https://github.com/lucat1/vhsnunzip
+	url = https://github.com/janoslim/vhsnunzip.git
