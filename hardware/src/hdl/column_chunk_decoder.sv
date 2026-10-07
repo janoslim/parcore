@@ -7,6 +7,10 @@ import libstf::data8_t;
 import libstf::data32_t;
 import libstf::type_t;
 import libstf::BYTE_T;
+import libstf::INT32_T;
+import libstf::FLOAT_T;
+import libstf::INT64_T;
+import libstf::DOUBLE_T;
 import parcore::*;
 
 module ColumnChunkDecoder #(
@@ -178,8 +182,10 @@ TypedDictionary #(
 // The TypedDictionary emits a single `last` per dictionary (hybrid-page
 // group), but the output multiplexer consumes out_select per page. This
 // re-injects a per-page `last` after each page's num_values worth of values.
+// rd6: CountedTypedRewriteLast (end of this file) = TypedRewriteLast behind a register slice that carries
+// each beat's value count and null flag; see its comment for the v09 link paths it removes.
 ready_valid_i #(data32_t) hybrid_num_values(clk, reset_synced);
-TypedRewriteLast #(
+CountedTypedRewriteLast #(
     .DATABEAT_SIZE(DATABEAT_SIZE)
 ) inst_hybrid_set_last (
     .clk(clk),
@@ -526,5 +532,113 @@ StreamProfiler inst_profile_out (
 //     .probe29(inner_out.last)
 // );
 // `endif
+
+endmodule
+
+// rd6 (decoder-timing-fix findings.md section 13). In the v09 full-design link (run-v09-v2-rd5-01) two
+// failing paths started at the dictionary output, the libstf Duplicate skid buffer's output mux, and went
+// straight into TypedRewriteLast: its 64-bit popcount, the division by the type width and the 32-bit
+// `>= remaining` compare make force_last, which is the output multiplexer's `last` and so its select.ready
+// and the ColumnChunkDecoder's out_select.valid (13 levels, -0.067 ns); and its null-beat test makes
+// in.ready, which is TypedDictionary's out.ready, the Dictionary's credit_return and through the Creditor
+// its in_ids.ready, TypedDictionary's state CE (11 levels, -0.027 ns). This is TypedRewriteLast with a
+// libstf SkidBuffer in front. The slice registers both directions, so the Dictionary's ready chain ends at
+// its in.ready flop, and it carries the beat's value count and null flag, computed in front of it exactly
+// as TypedRewriteLast computes them, so RewriteLastCore decides from flops. The slice keeps order and passes
+// one beat per cycle: the output beats are those of TypedRewriteLast, one cycle later.
+module CountedTypedRewriteLast #(
+    parameter type size_t = data32_t,
+    parameter DATABEAT_SIZE = AXI_DATA_BITS / 8
+) (
+    input logic clk,
+    input logic rst_n,
+
+    ready_valid_i.s num_elements, // #(size_t)
+
+    typed_ndata_i.s in, // #(DATABEAT_SIZE)
+    typed_ndata_i.m out // #(DATABEAT_SIZE)
+);
+
+// This is on purpose 1 bit wider to account for the case where keep is all ones.
+localparam ELEMENT_BITS = $clog2(DATABEAT_SIZE) + 1;
+logic [ELEMENT_BITS - 1:0] in_num_bytes, in_num_elements;
+assign in_num_bytes = $countones(in.keep);
+
+always_comb begin
+    in_num_elements = '0;
+
+    case (in.typ)
+        BYTE_T: begin
+            in_num_elements = in_num_bytes;
+        end
+        INT32_T, FLOAT_T: begin
+            in_num_elements = in_num_bytes / 4;
+        end
+        INT64_T, DOUBLE_T: begin
+            in_num_elements = in_num_bytes / 8;
+        end
+        default: begin
+        `ifndef SYNTHESIS
+            if (in.valid) begin
+                $fatal(1, "Unexpected type %d in CountedTypedRewriteLast", in.typ);
+            end
+        `endif
+        end
+    endcase
+end
+
+typedef struct packed {
+    data8_t[DATABEAT_SIZE - 1:0] data;
+    type_t                       typ;
+    logic[DATABEAT_SIZE - 1:0]   keep;
+    logic                        last;
+    logic[ELEMENT_BITS - 1:0]    num_elements;
+    logic                        is_null;
+} beat_t;
+ready_valid_i #(beat_t) slice_in(clk, rst_n), slice_out(clk, rst_n);
+
+assign slice_in.data.data         = in.data;
+assign slice_in.data.typ          = in.typ;
+assign slice_in.data.keep         = in.keep;
+assign slice_in.data.last         = in.last;
+assign slice_in.data.num_elements = in_num_elements;
+assign slice_in.data.is_null      = in.keep == '0;
+assign slice_in.valid             = in.valid;
+assign in.ready                   = slice_in.ready;
+
+SkidBuffer #(
+    .data_t(beat_t)
+) inst_in_slice (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .in(slice_in),
+    .out(slice_out)
+);
+
+logic force_last;
+RewriteLastCore #(
+    .size_t(size_t),
+    .ELEMENT_BITS(ELEMENT_BITS)
+) inst_core (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .num_elements(num_elements),
+
+    .in_valid(slice_out.valid),
+    .in_is_null_beat(slice_out.data.is_null),
+    .in_num_elements(slice_out.data.num_elements),
+    .out_ready(out.ready),
+
+    .force_last(force_last),
+    .out_valid(out.valid),
+    .in_ready(slice_out.ready)
+);
+
+assign out.data = slice_out.data.data;
+assign out.typ  = slice_out.data.typ;
+assign out.keep = slice_out.data.keep;
+assign out.last = force_last;
 
 endmodule
