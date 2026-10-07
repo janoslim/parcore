@@ -644,7 +644,13 @@ task goto_decode_bpe(
         // offset_after_varint + groups * bit_width = goto_base + length - 1,
         // the start of win_goto.
         varint_in.data <= win_goto;
-        varint_in.valid <= win_goto_valid;
+        // rd5 (findings.md section 12, B1): a header in the next beat of a buffer that does not shift in
+        // this cycle (offset_after_varint < 64 <= next header) is not prefetched as valid. varint_offset is
+        // stored trimmed just below, so finish_bpe() would otherwise consume it through goto_decode() with
+        // an index 64 bytes short and re-point into the old beat; with valid low it takes its else-branch,
+        // which adds the +64 and shifts (one cycle more, on this shape only). A 3-group run re-reads the
+        // header at its first input (advance_bpe(), rem==1), so nothing reads this valid before then.
+        varint_in.valid <= win_goto_valid && !(goto_index[$bits(offset_t) - 1] && !goto_oav[$bits(offset_t) - 1]);
         vbase_r <= goto_new_r;
         for (int k = 0; k < 4; k++) begin
             vbase_m[k] <= goto_new_m[k];
@@ -702,7 +708,10 @@ task advance_bpe();
         actual_varint_offset = increment_varint_offset ? varint_offset + NUM_BYTES : varint_offset;
         // The two candidate windows (at varint_offset and varint_offset + 64)
         // are read in parallel; the comparison above only selects.
-        next_varint_in_valid = increment_varint_offset ? win_at1_valid : win_at0_valid;
+        // rd5 (B1): the +64 window without a shift in this cycle would leave varint_offset trimmed while
+        // the header sits in the next beat; report it invalid so the branch below stores the untrimmed
+        // offset and finish_bpe() re-reads it through its else-branch.
+        next_varint_in_valid = increment_varint_offset ? win_at1_valid && next_offset >= NUM_BYTES : win_at0_valid;
 
         varint_in.data <= increment_varint_offset ? win_at1 : win_at0;
         varint_in.valid <= next_varint_in_valid;
@@ -793,6 +802,14 @@ task finish_rle();
     end else begin
         // If ~varint_out.valid we need to fetch more input to
         // satisfy it.
+        // rd5 (B2): the header was prefetched in goto_decode_rle(), possibly before the
+        // RLE value's second beat was loaded. Re-read it from the current buffer
+        // (varint_offset is in its coordinates: no shift happens in ST_DECODE_RLE),
+        // so ST_HEADER2 takes input only if the header really is incomplete. The
+        // pinned decoder kept the stale prefetch, and ST_HEADER2 then stored one more
+        // beat into the half still in use, which the next shift dropped.
+        varint_in.data <= win_at0;
+        varint_in.valid <= win_at0_valid;
         state <= ST_HEADER2;
     end
 endtask
