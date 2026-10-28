@@ -154,10 +154,16 @@ NDataToTypedNData #(DATABEAT_SIZE) inst_dict_typed_conversion (
 );
 
 typed_ndata_i #(DATABEAT_SIZE) hybrid_typed(clk, reset_synced);
+// gpu-smartssd-olap same-dictionary baseline (2026-10-28): 8 dictionary banks
+// instead of the default 16, so the dictionary serves 8 lookups per cycle, the
+// lookup width of the selective decoder it is compared with (4 copies x 2 URAM
+// ports). The 16 id lanes per beat are unchanged: the banks' crossbars go from
+// 16 lanes to 8 banks and back.
 TypedDictionary #(
     .id_t(id_t),
     .NUM_ELEMENTS(NUM_IDS),
-    .DATABEAT_SIZE(DATABEAT_SIZE)
+    .DATABEAT_SIZE(DATABEAT_SIZE),
+    .NUM_BANKS(8)
 ) inst_typed_dictionary (
     .clk(clk),
     .rst_n(reset_synced),
