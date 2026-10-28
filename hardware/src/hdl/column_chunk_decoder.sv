@@ -32,20 +32,22 @@ module ColumnChunkDecoder #(
 localparam NUM_IDS = 16;
 
 // ------ Multiplexing declarations ---------------
-localparam int NUM_IN = 3;
+localparam int NUM_IN = 4;
 typedef enum logic [$bits(page_type_t) - 1:0] {
     IN_HYBRID = PAGE_TYPE_HYBRID,
     IN_DICT = PAGE_TYPE_DICT,
-    IN_PLAIN = PAGE_TYPE_PLAIN
+    IN_PLAIN = PAGE_TYPE_PLAIN,
+    IN_DELTA = PAGE_TYPE_DELTA
 } in_selector_t;
 `ASSERT_ELAB(NUM_IN <= 2**$bits(in_selector_t))
 
 ndata_i #(data8_t, DATABEAT_SIZE) ins[NUM_IN](clk, reset_synced);
 
-localparam int NUM_OUT = 2;
-typedef enum logic {
+localparam int NUM_OUT = 3;
+typedef enum logic [1:0] {
   OUT_HYBRID = 0,
-  OUT_PLAIN = 1
+  OUT_PLAIN = 1,
+  OUT_DELTA = 2
 } out_selector_t;
 `ASSERT_ELAB(NUM_OUT <= 2**$bits(out_selector_t))
 typed_ndata_i #(DATABEAT_SIZE) outs[NUM_OUT](clk, reset_synced);
@@ -227,6 +229,29 @@ NDataToTypedNData #(DATABEAT_SIZE) inst_plain_type (
     .out(outs[OUT_PLAIN])
 );
 
+// ------ Delta wiring ----------------------------
+// gpu-smartssd-olap (2026-10-29): DELTA_BINARY_PACKED data pages. The register slice keeps the
+// demultiplexer's select and the decompressor's output out of the DeltaPageDecoder's window logic.
+ready_valid_i #(type_t) delta_type(clk, reset_synced);
+ndata_i #(data8_t, DATABEAT_SIZE) delta_in(clk, reset_synced);
+NDataRegSlice #(data8_t, DATABEAT_SIZE) inst_delta_in_slice (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .in(ins[IN_DELTA]),
+    .out(delta_in)
+);
+
+DeltaPageDecoder #(DATABEAT_SIZE) inst_delta_page_decoder (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .conf(delta_type),
+    .in(delta_in),
+
+    .out(outs[OUT_DELTA])
+);
+
 // ------ Output multiplexing ----------------------------
 typed_ndata_i #(DATABEAT_SIZE) inner_out(clk, reset_synced);
 TypedNDataMultiplexer #(DATABEAT_SIZE, NUM_OUT) inst_demultiplexer (
@@ -282,6 +307,7 @@ always_ff @(posedge clk) begin
         hybrid_conf.valid <= 1'b0;
         dict_type.valid   <= 1'b0;
         plain_type.valid  <= 1'b0;
+        delta_type.valid  <= 1'b0;
         in_select.valid   <= 1'b0;
         out_select.valid  <= 1'b0;
 
@@ -357,6 +383,24 @@ always_ff @(posedge clk) begin
                                 hybrid_conf.valid <= 1'b1;
                             end
                         end
+                        PAGE_TYPE_DELTA: begin
+                            in_select.data <= IN_DELTA;
+
+                            delta_type.data  <= typ;
+                            delta_type.valid <= 1'b1;
+
+                            out_select.data  <= OUT_DELTA;
+                            out_select.valid <= 1'b1;
+
+                            if (page_conf.data.last && dict_seen) begin
+                                // As for plain pages: a chunk that ends on a non-hybrid page after a
+                                // dictionary page resets the dictionary with a dummy beat (keep=0, last=1).
+                                hybrid_conf.data  <= '0;
+                                hybrid_conf.keep  <= 1'b0;
+                                hybrid_conf.last  <= 1'b1;
+                                hybrid_conf.valid <= 1'b1;
+                            end
+                        end
                     endcase
                 end
             end
@@ -375,6 +419,10 @@ always_ff @(posedge clk) begin
 
                 if (plain_type.ready) begin
                     plain_type.valid <= 1'b0;
+                end
+
+                if (delta_type.ready) begin
+                    delta_type.valid <= 1'b0;
                 end
 
                 if (in_select.ready) begin
@@ -397,7 +445,7 @@ always_ff @(posedge clk) begin
                 //   a new column chunk configuration next.
                 // - CONFIGURED if this was not the last page and this column
                 //   chunk has more pages to be fully decoded.
-                if (!decompressor_conf.valid && !hybrid_conf.valid && !dict_type.valid && !plain_type.valid && !in_select.valid && !out_select.valid) begin
+                if (!decompressor_conf.valid && !hybrid_conf.valid && !dict_type.valid && !plain_type.valid && !delta_type.valid && !in_select.valid && !out_select.valid) begin
                     if (last_page) begin
                         state <= ST_IDLE;
                     end else begin

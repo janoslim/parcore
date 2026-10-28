@@ -78,10 +78,12 @@ typedef struct packed {
     logic [VARINT_LENGTH_BITS - 1:0] length;
 } varint_t;
 
+// PAGE_TYPE_DELTA: a DELTA_BINARY_PACKED data page, decoded by DeltaPageDecoder (gpu-smartssd-olap, 2026-10-29).
 typedef enum logic [1:0] {
     PAGE_TYPE_HYBRID = 0,
     PAGE_TYPE_DICT = 1,
-    PAGE_TYPE_PLAIN = 2
+    PAGE_TYPE_PLAIN = 2,
+    PAGE_TYPE_DELTA = 3
 } page_type_t;
 
 typedef struct packed {

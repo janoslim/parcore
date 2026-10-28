@@ -235,11 +235,13 @@ always_comb begin
         PARSE_ENC: begin
             if (skip_bytes == 0 && remaining_bytes != 3) begin
                 if (parsed_page_type != PAGE_TYPE_DICT) begin
-                    // PLAIN=0, PLAIN_DICTIONARY=2, RLE_DICTIONARY=8 (Other encodings not supported
-                    // yet). For data pages we already use PAGE_TYPE_HYBRID as a default so only 
-                    // change for plain data pages.
+                    // PLAIN=0, PLAIN_DICTIONARY=2, DELTA_BINARY_PACKED=5, RLE_DICTIONARY=8 (Other encodings not
+                    // supported yet). For data pages we already use PAGE_TYPE_HYBRID as a default so only
+                    // change for plain and delta data pages.
                     if (cur_value == 32'd0) begin
                         n_parsed_page_type = PAGE_TYPE_PLAIN;
+                    end else if (cur_value == 32'd5) begin
+                        n_parsed_page_type = PAGE_TYPE_DELTA;
                     end
 
                     // Decrement only for data pages (hybrid and plain), not dict pages
