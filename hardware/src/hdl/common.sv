@@ -12,7 +12,10 @@ parameter int VARINT_NUM_BITS = VARINT_NUM_BYTES * 7;
 // varint, if 4 bytes are consumed that is 0b100, thus requiring clog2(4)
 // +1 bits.
 parameter int VARINT_LENGTH_BITS = $clog2(VARINT_NUM_BYTES)+1;
-parameter int ID_BITS = 19;
+// Changed from 19 for the gpu-smartssd-olap same-dictionary baselines
+// (2026-10-28): the dictionary holds 64KiB, the dictionary size of the
+// selective decoder it is compared with. See the comment above id_t.
+parameter int ID_BITS = 14;
 // Theoretically, a page could have more than 1Mi values inside. The
 // dictionary is usually capped around 1MiB, limiting the number of unique
 // values, but that does not matter. Consider a page where the dioctionary has
@@ -25,10 +28,13 @@ parameter int ID_BITS = 19;
 parameter int VALUES_BITS = 20;
 parameter int BPE_MASK_SIZE = ID_BITS;
 
-// Real-world dictionaries tend to sit slightly over 1MiB, so to have headroom
-// we support up to 2MiB dictionaries. That is 2^21 bytes. Since the
-// TypedDictionary uses 32bit elements (4 bytes), we subtract 2 bits (log2(4)),
-// leaving 2^19 entries. Thus 19 bits are enough to index any entry fully.
+// Upstream supports dictionaries of up to 2MiB (2^21 bytes), because
+// real-world dictionaries tend to sit slightly over 1MiB. This branch keeps
+// 64KiB (2^16 bytes), the dictionary of the selective decoder it is compared
+// with. Since the TypedDictionary uses 32bit elements (4 bytes), we subtract
+// 2 bits (log2(4)), leaving 2^14 entries: 16,384 INT32 values or 8,192 INT64
+// values (an INT64 value takes two entries). Thus 14 bits are enough to index
+// any entry fully.
 typedef logic [ID_BITS - 1:0] id_t;
 
 typedef enum logic {
@@ -39,10 +45,9 @@ typedef enum logic {
 // Number of bits in RLE/BPE encodings
 // "the bit width used to encode the entry ids stored as 1 byte (max bit width = 32)"
 // This is what the specification says. In pratice, this design only supports
-// ~2MiB dictionary pages, so the bit width won't be greater than 19 bits
-// (which are needed to index all values at the 32bit level over 2MiB).
-// In practice this is enough to support any realistic real-world parquet file,
-// which tend to stick to slighly over 1MiB.
+// 64KiB dictionary pages, so the bit width won't be greater than 14 bits
+// (which are needed to index all values at the 32bit level over 64KiB).
+// Pages with wider codes (dictionaries over 64KiB) are not supported.
 typedef logic [ID_BITS - 1:0] bit_width_t; 
 
 // Here we're using one extra bit to handle the case where we have exactly 1M
